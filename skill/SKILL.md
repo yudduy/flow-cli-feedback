@@ -12,6 +12,146 @@ description: >
 
 # Mithril Flow — Complete Reference
 
+## MANDATORY: Cost-Optimized Provisioning
+
+**NEVER hardcode a GPU type or price.** Spot prices swing 100x+ within hours (A100: $0.01 → $32/hr same day). Always check live pricing, pick the cheapest that works, and bid smart.
+
+### The Workflow (agents MUST follow for every provisioning)
+
+```bash
+# Step 1: Get live pricing as JSON
+PRICING=$(flow pricing --json)
+
+# Step 2: Parse top_rows — already sorted cheapest first
+# Structure: top_rows[].{gpu, region, current_fmt, cap_med_by_count.{N: bid}, avail_counts[]}
+echo "$PRICING" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for row in data['top_rows']:
+    gpu = row['gpu']
+    region = row['region']
+    price = row['current_fmt']
+    counts = row['avail_counts']
+    bids = row['cap_med_by_count']
+    print(f'{gpu:6s} {region:20s} {price:>8s}  counts={counts}  bid_caps={bids}')
+"
+
+# Step 3: Pick cheapest GPU that meets VRAM requirements (see table below)
+# Step 4: Use cap_med_by_count as bid cap — this is the recommended medium bid
+# Step 5: Provision
+
+flow instance create \
+  -i <instance_type> \
+  -r <region> \
+  -m <cap_med_bid> \
+  -n <name> \
+  --json
+```
+
+### JSON Structure Reference
+
+`flow pricing --json` returns:
+
+```json
+{
+  "top_rows": [                          // ← USE THIS — sorted cheapest first
+    {
+      "gpu": "b200",
+      "region": "us-central5-a",
+      "current_fmt": "$0.01",            // current spot price per GPU-hour
+      "cap_med_by_count": {              // recommended bid caps by GPU count
+        "1": 0.01,                       // ← use as -m flag value
+        "8": 0.01
+      },
+      "avail_counts": [1, 8]            // available configurations
+    }
+  ],
+  "raw_listings": [                      // all instances with exact availability
+    {
+      "region": "...",
+      "gpu_type": "...",
+      "gpu_count": 8,
+      "price_per_hour": 1.0,
+      "instance_type": "h100-80gb.sxm.8x",
+      "available_quantity": 38
+    }
+  ],
+  "recommendations_by_size": {           // low/med/high bid recommendations
+    "h100": {
+      "us-central2-a": {
+        "8": { "low": 1.15, "med": 1.1, "high": 1.25 }
+      }
+    }
+  }
+}
+```
+
+### Decision Logic
+
+1. Parse `top_rows` — it's already sorted cheapest first
+2. For each option, check: does this GPU meet my VRAM requirements? (see table)
+3. Check `avail_counts` — does the GPU count I need exist?
+4. First match = cheapest valid option
+5. Set `-m` to `cap_med_by_count[gpu_count]` — the platform's recommended bid
+6. Set `-r` to the `region` from the same row
+7. If nothing meets requirements or everything is too expensive → tell user, don't provision
+
+### Minimum VRAM Requirements (for GPU filtering)
+
+| Workload | Min VRAM per GPU | Min GPUs | Acceptable GPUs |
+|---|---|---|---|
+| Fine-tuning <=7B | 40 GB | 1 | Any (A100, H100, H200, B200) |
+| Fine-tuning 7-30B | 80 GB | 1 | Any (all have >=80GB) |
+| Fine-tuning 30-70B | 80 GB | 4-8 | 4xa100, 8xa100, 8xh100, 8xb200 |
+| Training from scratch | 80 GB | 8 | 8xa100, 8xh100, 8xb200 |
+| Long context >32k tokens | 141+ GB | 1+ | H200, B200 |
+| Inference / experiments | 80 GB | 1 | Any |
+
+**Any GPU in "Acceptable" works. Always pick whichever is cheapest RIGHT NOW.**
+
+### Concrete Example
+
+```bash
+# Agent needs 1 GPU with 80GB VRAM for a 13B fine-tune experiment
+PRICING=$(flow pricing --json)
+
+# Parse: top_rows shows B200 at $0.01, H100 at $1.00, A100 at $4.00
+# All have >= 80GB VRAM → all qualify
+# B200 is cheapest → use B200
+# cap_med_by_count["1"] = 0.01 → bid $0.01
+# region = us-central5-a
+
+flow instance create -i 1xb200 -r us-central5-a -m 0.01 -n my-experiment --json
+# Saved: $3.99/hr vs A100, $0.99/hr vs H100
+```
+
+### Price Volatility Patterns (observed)
+
+- Prices change in real-time — auction model, not fixed pricing
+- Overnight / weekends tend to be cheapest
+- Afternoon weekdays (US time) tend to be most expensive
+- Same GPU can swing $0.01 to $32+ within one day
+- **B200 can be cheaper than A100** — never assume newer = more expensive
+- Always re-check pricing before each new provision, even in the same session
+
+---
+
+## CRITICAL: SSH Key Configuration
+
+**Verify your SSH key is set up correctly BEFORE provisioning.** This is the #2 agent failure mode.
+
+```bash
+# Check: the default key MUST show Local ✓ AND Platform ✓
+flow ssh-key list
+
+# If the default key shows Local: - (missing locally), SSH will silently fail.
+# Fix: set a key that exists locally as default in ~/.flow/config.yaml
+```
+
+The SSH key used for provisioning is set in `~/.flow/config.yaml` under `ssh_keys`. If this key doesn't have a local private key, SSH auth will timeout even though port 22 is open.
+
+---
+
 ## CRITICAL: SSH Readiness Race Condition
 
 **`status=running` does NOT mean SSH is ready.** This is the #1 agent failure mode.
@@ -320,17 +460,25 @@ config:
 - Pricing is **per GPU-hour**. RAM doesn't affect price.
 - Second-price blind auction — you set a cap, pay market-clearing price (often lower).
 - Spot jobs can be preempted; Flow auto-heals and migrates tasks.
+- **Prices are volatile.** ALWAYS run `flow pricing` before provisioning. Never rely on cached/memorized prices.
 
 ```bash
+# Check live prices (MANDATORY before provisioning)
+flow pricing         # 7-day history, win rates, recommended bid caps
+flow availability    # current snapshot
+
+# Set max price per node (not per GPU)
 flow instance create -i 8xh100 -m 10.0   # -m = max price per hour per node
 ```
 
-| GPU | Typical spot range | Best for |
+**DO NOT use the table below for pricing decisions — it's a rough reference only. Run `flow pricing` for real numbers.**
+
+| GPU | 7-day observed range | Notes |
 |---|---|---|
-| A100 80GB | ~$1.00-2.50/GPU-hr | Dev, fine-tuning <=30B, inference |
-| H100 80GB | ~$1.50-3.50/GPU-hr | Large-scale training, high-throughput inference |
-| H200 141GB | Reservation only | Giant models, long-context |
-| B200 192GB | Premium | Bleeding-edge, FP4 inference |
+| A100 80GB | $0.01–$32.00/GPU-hr | Most volatile. Can be cheapest or most expensive. |
+| H100 80GB | $1.00–$10.00/GPU-hr | 8x only. Stable floor. |
+| H200 141GB | $1.00+/GPU-hr | 8x only. Limited availability. |
+| B200 192GB | $0.01–$25.00/GPU-hr | Can be absurdly cheap. Fastest GPU. Requires CUDA 13.0 image. |
 
 ---
 
