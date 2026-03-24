@@ -1,18 +1,16 @@
-# Flow CLI: Why It Wins for AI-Agent GPU Workflows
+# Mithril CLI Feedback: AI-Agent GPU Workflows
 
 User feedback from building autonomous AI agent workflows (Claude Code, Codex) on Mithril GPU infrastructure.
 
 ## Context
 
-I evaluated both CLIs for automating GPU provisioning and training jobs via AI coding agents:
-- **`flow`** — Python-based, 30+ commands, full platform CLI
-- **`mithril-cli`** (mcli) — Rust-based, focused instance management, delegates to flow for everything else
+I used both CLIs for automating GPU provisioning and training jobs via AI coding agents:
+- **`mithril-cli`** (mcli) — Rust binary. Native instance management + pass-through to flow for everything else.
+- **`flow`** — Python CLI/SDK. The full platform engine (30+ commands).
 
-Both report the same version (`flow, version 0.3.2`). They share identity — mcli is a native frontend to the same platform.
+Both report `flow, version 0.3.2`. mithril-cli delegates to flow for any command it doesn't handle natively — so **mcli is a superset**: everything flow can do, mcli can do via pass-through, plus native Rust implementations for the common operations.
 
-## Accurate Command Comparison
-
-### mithril-cli (Rust) — what it covers natively
+## What mithril-cli Covers Natively (Rust)
 
 | Command | Features |
 |---|---|
@@ -23,92 +21,69 @@ Both report the same version (`flow, version 0.3.2`). They share identity — mc
 | `instance list-types` | `--json`, `--verbose`, region filter |
 | `ssh` | Interactive picker, `--show`, `--no-wait`, multi-node |
 | `k8s` | list, info, ssh, update-kubeconfig |
-| `[ARGS]...` | **Pass-through to flow CLI for anything else** |
 
-**mcli does instance management well.** It has `--json` output, watch mode, dry-run, and a nice interactive SSH picker. For humans doing simple provisioning, it's solid.
+These are the hot-path operations — what you do most often. Fast native Rust, good `--json` output, nice interactive SSH picker.
 
-### flow (Python) — the full surface
+## What Comes Via Flow Pass-Through
 
-| Category | Commands |
+Everything else — and it's a lot:
+
+| Category | Commands (via `mithril-cli <args>`) |
 |---|---|
-| **Compute** | `instance`, `grab`, `dev`, `serve`, `reserve` |
-| **Jobs** | `submit`, `status`, `logs`, `cancel`, `ssh` |
-| **Resources** | `volume`, `ssh-key`, `k8s`, `cluster` (SLURM overlay) |
+| **Jobs** | `submit`, `status`, `logs`, `cancel` |
+| **Compute** | `grab`, `dev`, `serve`, `reserve` |
+| **Resources** | `volume`, `ssh-key`, `cluster` (SLURM overlay) |
 | **Tools** | `pricing`, `availability`, `ask` (AI-powered), `jupyter`, `colab`, `ports`, `deploy` |
-| **More** | `docs`, `upload-code`, `health`, `mount`, `slurm`, `claude`, `init`, `example`, `tutorial` |
+| **Ops** | `health`, `mount`, `upload-code`, `slurm`, `claude` |
 
-**Flow commands that have no mcli equivalent:**
-`submit`, `status`, `logs`, `cancel`, `grab`, `dev`, `serve`, `reserve`, `volume`, `ssh-key`, `cluster`, `pricing`, `availability`, `ask`, `jupyter`, `colab`, `ports`, `deploy`, `health`, `mount`, `slurm`, `claude`
+This is what makes the full agent lifecycle possible — submit, monitor, logs, cost intelligence, storage, port management.
 
-That's 22 command groups mcli doesn't have natively (it delegates them via pass-through).
+## What Works Well for AI Agents
 
-## Why Flow Wins for AI Agents
+The combination of native mcli + flow pass-through gives agents everything they need:
 
-Agents don't provision one instance and SSH in. They run full lifecycles: provision → wait → deploy → monitor → adjust → teardown. This needs:
-
-### 1. Job lifecycle commands
-```
-flow submit "python train.py" -i 8xh100    # run job
-flow status --json                          # poll
-flow logs <name> -f                         # monitor
-flow cancel <name>                          # teardown
-```
-mcli has none of these natively. An agent using mcli would pass-through to flow anyway — so why not just use flow directly?
-
-### 2. Cost intelligence
-```
-flow pricing --gpu h100                     # market prices
-flow availability --gpu b200                # what's available now
-flow ask "cheapest H100 in us-west?"        # AI-powered recommendations
-```
-An autonomous agent can make cost-optimal decisions without human intervention. mcli can't do this.
-
-### 3. Machine-readable output everywhere
-Both CLIs have `--json` on instance commands. But flow also has `--json` on `status`, `ssh`, `availability`, and more. Agents parse JSON — the broader the coverage, the more the agent can do without screen-scraping.
-
-### 4. Non-interactive operation
 ```bash
-echo y | flow cancel <name>     # no interactive prompt
-flow status --json              # no pretty tables to parse
-timeout 20 flow logs <name>     # bounded, won't hang
+# Full autonomous agent workflow — all via mithril-cli
+mithril-cli instance list-types --json       # check what's available (native Rust)
+mithril-cli instance create -i 8xh100 --json # provision (native Rust)
+mithril-cli instance list --json --state running  # poll status (native Rust)
+mithril-cli ssh <name> -- "echo READY"       # poll SSH readiness (native Rust)
+mithril-cli ssh <name> -- "nvidia-smi"       # verify GPUs (native Rust)
+mithril-cli submit "python train.py"         # run job (flow pass-through)
+mithril-cli logs <name>                      # monitor (flow pass-through)
+mithril-cli cancel <name>                    # teardown (flow pass-through)
 ```
 
-### 5. End-to-end without the web console
-With flow, this entire agent workflow works:
-```
-1. flow availability --json          # check GPU availability
-2. flow instance create -i 8xh100   # provision
-3. flow status --json                # poll until running
-4. flow ssh <name> -- "echo READY"   # poll until SSH ready
-5. flow ssh <name> -- "nvidia-smi"   # verify GPUs
-6. flow submit "python train.py"     # run the job
-7. timeout 20 flow logs <name>       # monitor output
-8. echo y | flow cancel <name>       # teardown
-```
-With mcli, steps 1, 6, 7 require either pass-through to flow or dropping to the web console. The agent can't stay in its loop.
+**What makes it agent-friendly:**
+- `--json` output on native commands (and flow commands that support it)
+- Non-interactive operation (`echo y | mithril-cli cancel <name>`)
+- Full lifecycle without dropping to web console
+- Pass-through means no capability gap vs flow
 
 ## The Agent Skill I Built
 
-See [`skill/SKILL.md`](./skill/SKILL.md) — a complete Claude Code skill for Flow covering:
-- **SSH readiness race condition** — `status=running` does NOT mean SSH is ready (the #1 agent failure mode)
+See [`skill/SKILL.md`](./skill/SKILL.md) — a Claude Code skill for autonomous GPU workflows covering:
+- **SSH readiness race condition** — `status=running` ≠ SSH ready (the #1 agent failure mode)
 - **GPU selection decision tree** — which instance type for which workload
 - **Agent-friendly debugging checklist** — step-by-step, no assumptions
 - **Cost/bid management** — auction mechanics, typical price ranges
 - **Multi-node distributed training** — InfiniBand, NCCL, torchrun patterns
-- **All gotchas encountered** — with symptoms, causes, and fixes
+- **Gotcha table** — symptoms, causes, fixes for every issue I hit
 
-This skill enables fully autonomous GPU workflows. It couldn't be built around mcli alone — there isn't enough native surface for the job lifecycle.
+This skill was written against flow commands but works identically via mithril-cli pass-through.
 
-## One Gap: SSH Proxy
+## One Blocker: SSH Proxy
 
-`flow ssh` connects directly to the instance's public IP on port 22. No relay/proxy. Port 22 was blocked from my network (confirmed via `nc -zv`). Everything else worked (status, cancel, submit — all HTTP API).
+`flow ssh` / `mithril-cli ssh` connects directly to the instance's public IP on port 22. No relay or proxy. Port 22 was blocked from my network (confirmed via `nc -zv <ip> 22`). Everything HTTP-based worked fine (status, cancel, submit).
 
-A relay/proxy layer for SSH would make flow work from any network without firewall exceptions. This is the single biggest blocker I hit.
+**This is the single biggest blocker I hit.** A relay/proxy layer for SSH would make Mithril work from any network — corporate firewalls, university networks, coffee shops — without requiring port 22 outbound.
 
-## Bottom Line
+## Suggestions
 
-**mcli is good for what it does** — fast Rust binary, nice interactive SSH picker, solid instance management with `--json`. For humans doing quick provisioning, it works.
+1. **SSH relay/proxy** — #1 priority. Blocked port 22 = blocked SSH = blocked logs, blocked commands, blocked everything interactive. An HTTPS-tunneled relay would fix this universally.
 
-**flow is what agents need** — 30+ commands covering the full lifecycle. Submit, monitor, logs, pricing, volumes, ports, deploy. The surface area makes autonomous GPU workflows possible.
+2. **`--json` on pass-through commands** — Native mcli commands have great `--json` support. Ensuring flow pass-through commands also consistently support `--json` would help agents parse everything uniformly.
 
-Since mcli delegates to flow for everything beyond instance management anyway, investing in flow as the primary CLI makes sense. It's already the engine — mcli is the dashboard.
+3. **Non-interactive defaults for agents** — Some commands prompt for confirmation (cancel). A `--yes` or `--non-interactive` flag across the board would help automated workflows.
+
+4. **Startup readiness signal** — `status=running` with `started_at` set doesn't mean SSH is ready. An explicit `ssh_ready` field in status JSON would eliminate the polling loop every agent has to implement.
